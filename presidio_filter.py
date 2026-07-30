@@ -9,32 +9,27 @@ class PII_filter:
     def __init__(self):
         self.swedish_nlp_config = {
             "nlp_engine_name": "spacy",
-            "models": [
-                {
-                    "lang_code": "sv", 
-                    "model_name": "sv_core_news_lg"
-                    }
-                ],
+            "models": [{"lang_code": "sv", "model_name": "sv_core_news_lg"}],
             "ner_model_configuration": {
                 "labels_to_ignore": ["O", "LOC", "ORG", "TME"],
-                "model_to_presidio_entity_mapping": {
-                    "PRS": "PERSON"  # Maps spaCy's Swedish 'PRS' label to Presidio's 'PERSON'
-                    }
-                }
+                # PRS needs to be manually mapped to the PERSON ENTITY
+                "model_to_presidio_entity_mapping": {"PRS": "PERSON"}
             }
+        }
+        
         self.provider = NlpEngineProvider(nlp_configuration=self.swedish_nlp_config)
         self.swedish_nlp_engine = self.provider.create_engine()
         self.analyzer = AnalyzerEngine(nlp_engine=self.swedish_nlp_engine, supported_languages=["sv"])
         self.anonymizer = AnonymizerEngine()
     
-    def _sync_apply_filter(self, content_raw: str) -> str:
+    def _sync_apply_filter(self, content_raw: str, client_id: str) -> str:
         if not isinstance(content_raw, str):
             content_raw = str(content_raw)
         if not content_raw.strip():
             return content_raw
         
         # check currenly enabled entities and tokens
-        current_entities, current_tokens = runtime_config.get_current()
+        current_entities, current_tokens = runtime_config.get_current(client_id)
         
         analysis_results = self.analyzer.analyze(
             text=content_raw, 
@@ -55,6 +50,6 @@ class PII_filter:
         )
         return anonymized_result.text
     
-    async def apply_filter(self, content_raw: str) -> str:
+    async def apply_filter(self, content_raw: str, client_id: str) -> str:
         """Asynchronous wrapper to offload CPU work to a worker thread."""
-        return await asyncio.to_thread(self._sync_apply_filter, content_raw)
+        return await asyncio.to_thread(self._sync_apply_filter, content_raw, client_id)

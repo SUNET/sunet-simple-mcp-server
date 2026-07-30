@@ -22,8 +22,8 @@ server_ready = threading.Event()
 def print_welcome_banner():
     """Prints the clean header layout, scaled under 80 characters."""
     print("\n================================================================")
-    print("[!] INTERACTIVE RUNTIME CLI ACTIVE")
-    print("Commands: status | add/remove <E> | token <E> <V> | clear | exit")
+    print(" ################ SUNET SIMPLE MCP TEST SERVER ################ ")
+    print("[!] INTERACTIVE RUNTIME CLI ACTIVE, TYPE: \'help\' for commands.")
     print("================================================================\n")
 
 def interactive_cli_loop():
@@ -43,37 +43,53 @@ def interactive_cli_loop():
             parts = line.split()
             cmd = parts[0].lower()
             
-            if cmd == "status":
-                entities, tokens = runtime_config.get_current()
-                print(f"[*] Active Entities : {entities}")
-                print(f"[*] Replacement Tokens: {tokens}")
+            if cmd == "help":
+                print("\n=========================================================================")
+                print("Commands: clients")
+                print("          status <client>")
+                print("          add/remove <client> <E>")
+                print("          token <client> <E> <V> | clear | exit")
+                print("=========================================================================\n")
+            
+            elif cmd == "clients":
+                active = runtime_config.get_current_clients()
+                print(f"[*] Tracked Clients: {active if active else 'None yet (Defaults will apply)'}")
+            
+            elif cmd == "status" and len(parts) > 1:
+                client_id = parts[1]
+                entities, tokens = runtime_config.get_current(client_id)
+                print(f"[*] [{client_id}] Active Entities : {entities}")
+                print(f"[*] [{client_id}] Replacement Tokens: {tokens}")
                 
-            elif cmd == "add" and len(parts) > 1:
-                entity = parts[1].upper()
-                entities, tokens = runtime_config.get_current()
+            elif cmd == "add" and len(parts) > 2:
+                client_id = parts[1]
+                entity = parts[2].upper()
+                entities, tokens = runtime_config.get_current(client_id)
                 if entity not in entities:
                     entities.append(entity)
-                    runtime_config.update(entities, tokens)
-                    print(f"[+] Added target entity: {entity}")
+                    runtime_config.update(client_id, entities, tokens)
+                    print(f"[+] [{client_id}] Added target entity: {entity}")
                 else:
-                    print(f"[-] {entity} already active.")
+                    print(f"[!] [{client_id}] {entity} already active.")
                     
-            elif cmd == "remove" and len(parts) > 1:
-                entity = parts[1].upper()
-                entities, tokens = runtime_config.get_current()
+            elif cmd == "remove" and len(parts) > 2:
+                client_id = parts[1]
+                entity = parts[2].upper()
+                entities, tokens = runtime_config.get_current(client_id)
                 if entity in entities:
                     entities.remove(entity)
-                    runtime_config.update(entities, tokens)
-                    print(f"[-] Removed target entity: {entity}")
+                    runtime_config.update(client_id, entities, tokens)
+                    print(f"[-] [{client_id}] Removed entity: {entity}")
                 else:
-                    print(f"[-] {entity} is not in the active filter lists.")
+                    print(f"[!] [{client_id}] {entity} is not in the active.")
                     
-            elif cmd == "token" and len(parts) > 2:
-                entity = parts[1].upper()
-                token_val = " ".join(parts[2:]) # Allows tokens with spaces
-                entities, tokens = runtime_config.get_current()
+            elif cmd == "token" and len(parts) > 3:
+                client_id = parts[1]
+                entity = parts[2].upper()
+                token_val = " ".join(parts[3:]) # Allows tokens with spaces
+                entities, tokens = runtime_config.get_current(client_id)
                 tokens[entity] = token_val
-                runtime_config.update(entities, tokens)
+                runtime_config.update(client_id, entities, tokens)
                 print(f"[+] Token mapping saved: {entity} -> {token_val}")
             
             elif cmd == "clear":
@@ -85,9 +101,10 @@ def interactive_cli_loop():
                 print("[*] Terminating MCP Server...")
                 sys.exit(0)
             else:
-                print("[-] Command not recognized. Use: status, add, remove, token, exit")
+                print("[!] Command mismatch or missing arguments.")
+                print(" Usage: help | status <client> | add/remove <client> <E> | token <client> <E> <V> | clients")
         except Exception as e:
-            print(f"[-] CLI Error processing inputs: {e}")
+            print(f"[!] CLI Error processing inputs: {e}")
 
 def run_node():
     # 1. Start the runtime CLI parser thread

@@ -5,7 +5,7 @@ import tempfile
 import sys
 import pymupdf
 import logging
-pymupdf.set_messages(pylogging_level=logging.WARNING + 1)
+pymupdf.set_messages(pylogging_level=logging.WARNING + 1) # disable unnecessary logging
 
 import pymupdf4llm
 from presidio_filter import PII_filter
@@ -59,7 +59,7 @@ class NextCloudClient:
         """Isolated structural wrapper for CPU bound document extractions."""
         return pymupdf4llm.to_markdown(path, show_progress=False)
 
-    async def read_file(self, file_path: str) -> str:
+    async def read_file(self, file_path: str, client_id: str = "default_client") -> str:
         """Read the content of a file from NextCloud."""
         temp_dir = tempfile.gettempdir()
         temp_name = os.path.join(temp_dir, f"mcp_{os.path.basename(file_path)}")
@@ -77,7 +77,7 @@ class NextCloudClient:
                     content_raw = f.read()
                         
             # Remove personal information from content.
-            return await self.filter.apply_filter(content_raw=content_raw)
+            return await self.filter.apply_filter(content_raw=content_raw, client_id=client_id)
         
         except Exception as e:
             sys.stderr.write(f"Error reading file {file_path}: {e}")
@@ -89,14 +89,14 @@ class NextCloudClient:
                 except Exception as e:
                     sys.stderr.write(f"Failed to clear disk resource {temp_name}: {e}\n")
         
-    async def build_context(self) -> Dict[str, str]:
+    async def build_context(self, client_id: str = "default_client") -> Dict[str, str]:
         """Build context from all files in the shared folder."""
         files = await self.list_files()
         if not files or "error, unable to read files" in files:
             return {}
             
         # Run all file processing routines concurrently using asyncio.gather
-        tasks = [self.read_file(f) for f in files]
+        tasks = [self.read_file(f, client_id=client_id) for f in files]
         contents = await asyncio.gather(*tasks)
         
         return dict(zip(files, contents))

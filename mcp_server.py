@@ -1,4 +1,8 @@
-from mcp.server.fastmcp import FastMCP
+import hashlib
+import re
+import secrets
+
+from mcp.server.fastmcp import FastMCP, Context
 from dotenv import load_dotenv
 import os
 from nextcloud_client import NextCloudClient
@@ -22,6 +26,97 @@ def init_server():
     pii_filter = PII_filter()
     nextcloud_client = NextCloudClient(hostname, share_token, pii_filter)
 
+
+def _slugify(name: str) -> str:
+    """Turn an arbitrary client-supplied name into a short, readable, safe id."""
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", name.strip()).strip("-").lower()
+    return slug[:40] or "client"
+
+
+def _short_hash(*parts: str, length: int = 6) -> str:
+    """Deterministic short fingerprint, used to disambiguate or key anonymous ids."""
+    joined = "|".join(p for p in parts if p)
+    return hashlib.sha256(joined.encode("utf-8", errors="ignore")).hexdigest()[:length]
+
+
+def _extract_headers(request_context) -> dict:
+    """Best-effort header lookup across the couple of shapes FastMCP/transports expose."""
+    headers = getattr(request_context, "headers", None)
+    if headers:
+        return dict(headers)
+    raw_request = getattr(request_context, "request", None)
+    if raw_request is not None and hasattr(raw_request, "headers"):
+        try:
+            return dict(raw_request.headers)
+        except Exception:
+            pass
+    return {}
+
+
+def _extract_client_host(request_context):
+    """Best-effort remote address lookup, used only as a last-resort fingerprint."""
+    raw_request = getattr(request_context, "request", None)
+    client = getattr(raw_request, "client", None) if raw_request is not None else None
+    return getattr(client, "host", None)
+
+
+def _get_client_id(ctx: Context) -> str:
+    """Resolve a readable, per-client id from the FastMCP Context.
+
+    Priority, highest first:
+      1. An explicit `x-client-id` header - used verbatim (sanitized). This is
+         the reliable option: point any client at this if you want its
+         filter settings to be stable and easy to find in the web GUI/CLI.
+      2. The MCP `client_info.name` sent during initialization - turned into
+         a readable slug (e.g. "claude-desktop"). A short hash suffix is
+         appended only when needed to keep two different real connections
+         that happen to share a name from colliding onto one config.
+      3. No name, but the transport gives us *something* stable to key off
+         (a session id header, or failing that the remote address) -
+         "anon-<hash>", stable for that connection/session.
+      4. Nothing identifiable at all - a fresh random "anon-<random>" id.
+
+    Caveat: this server runs with stateless_http=True, so a fully anonymous
+    client with no session header and no client_info name will get a NEW
+    random id on every tool call (case 4), meaning per-client settings for
+    it won't persist between calls. That's an inherent limit of having no
+    session/identity signal to correlate calls by, not something this
+    function can work around - if you need persistence for such clients,
+    have them send `x-client-id`.
+    """
+    if not (ctx and hasattr(ctx, "request_context") and ctx.request_context):
+        return f"anon-{secrets.token_hex(3)}"
+
+    request_context = ctx.request_context
+    headers = _extract_headers(request_context)
+
+    # 1. Explicit header always wins.
+    explicit_id = headers.get("x-client-id")
+    if explicit_id:
+        return _slugify(explicit_id)
+
+    # Whatever connection fingerprint is available, for disambiguation/stability.
+    session_id = headers.get("mcp-session-id") or getattr(request_context, "session_id", None)
+    client_host = _extract_client_host(request_context)
+
+    # 2. Named client -> readable slug, disambiguated only if needed.
+    meta = getattr(request_context, "meta", None)
+    client_info = getattr(meta, "client_info", None) if meta else None
+    client_name = getattr(client_info, "name", None) if client_info else None
+    if client_name:
+        base = _slugify(client_name)
+        fingerprint = session_id or client_host
+        return f"{base}-{_short_hash(str(fingerprint))}" if fingerprint else base
+
+    # 3. No name, but something stable to key an anonymous id off of.
+    if session_id:
+        return f"anon-{_short_hash(str(session_id))}"
+    if client_host:
+        return f"anon-{_short_hash(client_host)}"
+
+    # 4. Truly nothing to go on.
+    return f"anon-{secrets.token_hex(3)}"
+
 @mcp.tool()
 async def list_all_files() -> dict:
     """List available files in the NextCloud shared folder.
@@ -40,22 +135,24 @@ async def list_all_files_detailed() -> dict:
     return {"files": files}
 
 @mcp.tool()
-async def read_file(filename: str) -> str:
+async def read_file(filename: str, ctx: Context = None) -> str:
     """Reads the contents of a single file.
     
     Args:
         filename: Full file name (e.g. 2025-08050_3.1 Beslut.pdf)
     """
-    return await nextcloud_client.read_file(filename)
+    client_id = _get_client_id(ctx)
+    return await nextcloud_client.read_file(filename, client_id=client_id)
     
 
 @mcp.tool()
-async def folder_context() -> dict[str, str]:
+async def folder_context(ctx: Context = None) -> dict[str, str]:
     """List all available files in the NextCloud shared folder. then reads 
      all of the files and sends it back in a dict with strings in order to 
      build context for the folder and all included items.
      """
-    return await nextcloud_client.build_context()
+    client_id = _get_client_id(ctx)
+    return await nextcloud_client.build_context(client_id=client_id)
 
 def main():
     # Initialize and run the server, this is a fallback for no cli
