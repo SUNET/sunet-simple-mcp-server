@@ -363,9 +363,14 @@ function renderClient(id, cfg) {
       ${tokenRows || '<span class="muted">Add an entity to configure its token</span>'}
       <div class="config-snippet">
         <code>x-client-id: ${id}</code>
-        <button class="secondary" onclick="copySnippet('${id}')">Copy header</button>
+        <button class="secondary" onclick="copySnippet('x-client-id: ${id}')">Copy header</button>
       </div>
       <div class="muted" style="margin-top:6px">Send this header from your MCP client so its requests land under this id.</div>
+      <div class="config-snippet">
+        <code>?client_id=${id}</code>
+        <button class="secondary" onclick="copySnippet('?client_id=${id}')">Copy URL suffix</button>
+      </div>
+      <div class="muted" style="margin-top:6px">No custom headers in your client (e.g. Odysseus)? Append this to the MCP server URL instead.</div>
       <div class="row" style="margin-top:12px">
         <button class="secondary" onclick="resetClient('${id}')">Reset to defaults</button>
       </div>
@@ -373,8 +378,8 @@ function renderClient(id, cfg) {
   `;
 }
 
-function copySnippet(id) {
-  navigator.clipboard.writeText(`x-client-id: ${id}`);
+function copySnippet(text) {
+  navigator.clipboard.writeText(text);
 }
 
 function toggleCustomEntity(id) {

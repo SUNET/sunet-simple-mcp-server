@@ -60,6 +60,23 @@ def _extract_client_host(request_context):
     return getattr(client, "host", None)
 
 
+def _extract_query_params(request_context) -> dict:
+    """Best-effort query-string lookup on the underlying request.
+
+    Exists for MCP clients whose UI only accepts a server URL and gives no
+    way to set custom headers (e.g. Odysseus). Those clients can still pass
+    an id by putting it directly in the URL: .../mcp?client_id=alice-laptop
+    """
+    raw_request = getattr(request_context, "request", None)
+    query_params = getattr(raw_request, "query_params", None) if raw_request is not None else None
+    if query_params is None:
+        return {}
+    try:
+        return dict(query_params)
+    except Exception:
+        return {}
+
+
 def _get_client_id(ctx: Context) -> str:
     """Resolve a readable, per-client id from the FastMCP Context.
 
@@ -67,14 +84,18 @@ def _get_client_id(ctx: Context) -> str:
       1. An explicit `x-client-id` header - used verbatim (sanitized). This is
          the reliable option: point any client at this if you want its
          filter settings to be stable and easy to find in the web GUI/CLI.
-      2. The MCP `client_info.name` sent during initialization - turned into
+      2. A `client_id` query parameter on the server URL itself, e.g.
+         `.../mcp?client_id=alice-laptop` - same intent as the header above,
+         for clients whose UI only lets you enter a URL and offers no way
+         to set custom headers.
+      3. The MCP `client_info.name` sent during initialization - turned into
          a readable slug (e.g. "claude-desktop"). A short hash suffix is
          appended only when needed to keep two different real connections
          that happen to share a name from colliding onto one config.
-      3. No name, but the transport gives us *something* stable to key off
+      4. No name, but the transport gives us *something* stable to key off
          (a session id header, or failing that the remote address) -
          "anon-<hash>", stable for that connection/session.
-      4. Nothing identifiable at all - a fresh random "anon-<random>" id.
+      5. Nothing identifiable at all - a fresh random "anon-<random>" id.
 
     Caveat: this server runs with stateless_http=True, so a fully anonymous
     client with no session header and no client_info name will get a NEW
@@ -89,17 +110,24 @@ def _get_client_id(ctx: Context) -> str:
 
     request_context = ctx.request_context
     headers = _extract_headers(request_context)
+    query_params = _extract_query_params(request_context)
 
     # 1. Explicit header always wins.
     explicit_id = headers.get("x-client-id")
     if explicit_id:
         return _slugify(explicit_id)
 
+    # 2. Explicit query param - same intent as the header, for clients that
+    # can only be pointed at a URL (see _extract_query_params docstring).
+    explicit_id_qp = query_params.get("client_id") or query_params.get("x-client-id")
+    if explicit_id_qp:
+        return _slugify(explicit_id_qp)
+
     # Whatever connection fingerprint is available, for disambiguation/stability.
     session_id = headers.get("mcp-session-id") or getattr(request_context, "session_id", None)
     client_host = _extract_client_host(request_context)
 
-    # 2. Named client -> readable slug, disambiguated only if needed.
+    # 3. Named client -> readable slug, disambiguated only if needed.
     meta = getattr(request_context, "meta", None)
     client_info = getattr(meta, "client_info", None) if meta else None
     client_name = getattr(client_info, "name", None) if client_info else None
@@ -108,13 +136,13 @@ def _get_client_id(ctx: Context) -> str:
         fingerprint = session_id or client_host
         return f"{base}-{_short_hash(str(fingerprint))}" if fingerprint else base
 
-    # 3. No name, but something stable to key an anonymous id off of.
+    # 4. No name, but something stable to key an anonymous id off of.
     if session_id:
         return f"anon-{_short_hash(str(session_id))}"
     if client_host:
         return f"anon-{_short_hash(client_host)}"
 
-    # 4. Truly nothing to go on.
+    # 5. Truly nothing to go on.
     return f"anon-{secrets.token_hex(3)}"
 
 @mcp.tool()

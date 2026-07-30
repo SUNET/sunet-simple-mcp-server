@@ -98,9 +98,12 @@ no new business logic beyond ownership, just a friendlier way to reach it.
 
 - **Client IDs still have to match**: creating `alice-laptop` in the
   dashboard doesn't do anything to the real MCP connection on its own —
-  Alice still has to configure her MCP client to send
-  `x-client-id: alice-laptop` (the card shows this). If her client instead
-  relies on `client_info.name`, it may land under a different derived id
+  Alice still has to point her MCP client at that same id, either via the
+  `x-client-id` header or, for clients that only let you enter a URL and
+  have no way to set custom headers (e.g. Odysseus), by appending
+  `?client_id=alice-laptop` to the server URL instead. Both are shown on
+  each client's card. If her client instead relies on `client_info.name`
+  with neither option available, it may land under a different derived id
   and won't pick up the settings she configured.
 - **One shared NextCloud folder, for now**: every client_id still reads
   from the same `HOSTNAME`/`SHARED_TOKEN` NextCloud share in `.env` — the
