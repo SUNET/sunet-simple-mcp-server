@@ -1,3 +1,4 @@
+import getpass
 import sys
 import threading
 import logging
@@ -49,6 +50,9 @@ def interactive_cli_loop():
                 print("          status <client>")
                 print("          add/remove <client> <E>")
                 print("          token <client> <E> <V> | clear | exit")
+                print("          --- webgui accounts ---")
+                print("          adduser <username>   (prompts for password)")
+                print("          users")
                 print("=========================================================================\n")
             
             elif cmd == "clients":
@@ -92,6 +96,23 @@ def interactive_cli_loop():
                 runtime_config.update(client_id, entities, tokens)
                 print(f"[+] Token mapping saved: {entity} -> {token_val}")
             
+            elif cmd == "adduser" and len(parts) > 1:
+                username = parts[1]
+                password = getpass.getpass(f"Password for '{username}': ")
+                confirm = getpass.getpass("Confirm password: ")
+                if password != confirm:
+                    print("[!] Passwords didn't match, account not created.")
+                elif not password:
+                    print("[!] Password can't be empty.")
+                elif runtime_config.create_user(username, password):
+                    print(f"[+] Webgui account created: {username}")
+                else:
+                    print(f"[!] Username '{username}' is already taken.")
+
+            elif cmd == "users":
+                accounts = runtime_config.list_users()
+                print(f"[*] Webgui accounts: {accounts if accounts else 'None yet'}")
+
             elif cmd == "clear":
                 # Clear terminal screen dynamically based on OS
                 subprocess.run('cls' if os.name == 'nt' else 'clear')

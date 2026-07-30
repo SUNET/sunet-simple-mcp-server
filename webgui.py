@@ -9,10 +9,15 @@ processes if you don't run them from the same directory).
 Run with:
     uvicorn webgui:app --host 0.0.0.0 --port 8421
 
-Optional auth:
-    Set WEBGUI_PASSWORD to require a login before the dashboard is usable.
-    If it's unset, the GUI is open to anyone who can reach the port -- fine
-    for a trusted internal network, not fine for the public internet.
+Accounts:
+    Every visitor now logs in as themselves rather than sharing one
+    password. Accounts aren't self-service on purpose (this keeps the
+    dashboard's "list of clients" meaningful per person) - provision them
+    from the CLI:
+
+        python cli.py
+        mcp-filter> adduser alice
+
     Set WEBGUI_SECRET_KEY to a random string in production (used to sign
     the session cookie). A default is generated at startup otherwise, which
     means sessions won't survive a restart.
@@ -28,7 +33,6 @@ from pydantic import BaseModel
 
 from filter_state import runtime_config
 
-WEBGUI_PASSWORD = os.getenv("WEBGUI_PASSWORD")  # None => auth disabled
 WEBGUI_SECRET_KEY = os.getenv("WEBGUI_SECRET_KEY", secrets.token_hex(32))
 
 # A curated shortlist of Presidio entity types relevant to this deployment.
@@ -53,15 +57,12 @@ app.add_middleware(SessionMiddleware, secret_key=WEBGUI_SECRET_KEY)
 # --------------------------------------------------------------------------
 # Auth helpers
 # --------------------------------------------------------------------------
-def auth_enabled() -> bool:
-    return bool(WEBGUI_PASSWORD)
-
-
-def require_login(request: Request):
-    if not auth_enabled():
-        return
-    if not request.session.get("authed"):
+def require_login(request: Request) -> str:
+    """Returns the logged-in username, or redirects to /login."""
+    username = request.session.get("user")
+    if not username:
         raise HTTPException(status_code=status.HTTP_303_SEE_OTHER, headers={"Location": "/login"})
+    return username
 
 
 @app.exception_handler(HTTPException)
@@ -73,18 +74,20 @@ async def redirect_to_login(request: Request, exc: HTTPException):
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_form(request: Request):
-    if not auth_enabled():
+    if request.session.get("user"):
         return RedirectResponse(url="/", status_code=303)
     error = request.query_params.get("error")
-    error_html = '<p class="error">Wrong password.</p>' if error else ""
+    error_html = '<p class="error">Wrong username or password.</p>' if error else ""
     return HTMLResponse(PAGE_LOGIN.replace("__ERROR__", error_html))
 
 
 @app.post("/login")
 async def login_submit(request: Request):
     form = await request.form()
-    if form.get("password") == WEBGUI_PASSWORD:
-        request.session["authed"] = True
+    username = str(form.get("username", "")).strip().lower()
+    password = str(form.get("password", ""))
+    if username and runtime_config.verify_user(username, password):
+        request.session["user"] = username
         return RedirectResponse(url="/", status_code=303)
     return RedirectResponse(url="/login?error=1", status_code=303)
 
@@ -92,22 +95,23 @@ async def login_submit(request: Request):
 @app.post("/logout")
 async def logout(request: Request):
     request.session.clear()
-    return RedirectResponse(url="/login" if auth_enabled() else "/", status_code=303)
+    return RedirectResponse(url="/login", status_code=303)
 
 
 # --------------------------------------------------------------------------
 # Dashboard
 # --------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request, _=Depends(require_login)):
-    logout_button = '<button onclick="logout()">Log out</button>' if auth_enabled() else ""
+async def dashboard(request: Request, username: str = Depends(require_login)):
     page = PAGE_DASHBOARD.replace("__COMMON_ENTITIES__", str(COMMON_ENTITIES))
-    page = page.replace("__LOGOUT_BUTTON__", logout_button)
+    page = page.replace("__USERNAME__", username)
     return HTMLResponse(page)
 
 
 # --------------------------------------------------------------------------
 # JSON API consumed by the dashboard's JS
+# All client-scoped routes check ownership: a client_id only shows up for
+# / can be edited by the user who created or claimed it.
 # --------------------------------------------------------------------------
 class EntityBody(BaseModel):
     entity: str
@@ -118,24 +122,45 @@ class TokenBody(BaseModel):
     token: str
 
 
+def _owned_or_403(client_id: str, username: str):
+    owner = runtime_config.get_owner(client_id)
+    if owner != username:
+        raise HTTPException(403, "You don't have access to this client.")
+
+
 @app.get("/api/clients")
-async def api_list_clients(_=Depends(require_login)):
-    clients = runtime_config.get_current_clients()
+async def api_list_clients(username: str = Depends(require_login)):
     result = {}
-    for cid in clients:
+    for cid in runtime_config.get_clients_for_owner(username):
         entities, tokens = runtime_config.get_current(cid)
         result[cid] = {"entities": entities, "tokens": tokens}
     return JSONResponse(result)
 
 
+@app.post("/api/clients/{client_id}")
+async def api_claim_client(client_id: str, username: str = Depends(require_login)):
+    """Create a brand new client_id owned by the caller, or attach the
+    caller to one that already exists but is unclaimed (e.g. it showed up
+    from a real MCP connection before anyone had added it in the GUI)."""
+    client_id = client_id.strip()
+    if not client_id:
+        raise HTTPException(400, "Client id can't be empty.")
+    if not runtime_config.claim_client(client_id, username):
+        raise HTTPException(409, "That client id is already claimed by another user.")
+    entities, tokens = runtime_config.get_current(client_id)
+    return {"entities": entities, "tokens": tokens}
+
+
 @app.get("/api/clients/{client_id}")
-async def api_get_client(client_id: str, _=Depends(require_login)):
+async def api_get_client(client_id: str, username: str = Depends(require_login)):
+    _owned_or_403(client_id, username)
     entities, tokens = runtime_config.get_current(client_id)
     return {"entities": entities, "tokens": tokens}
 
 
 @app.post("/api/clients/{client_id}/entities")
-async def api_add_entity(client_id: str, body: EntityBody, _=Depends(require_login)):
+async def api_add_entity(client_id: str, body: EntityBody, username: str = Depends(require_login)):
+    _owned_or_403(client_id, username)
     entity = body.entity.strip().upper()
     if not entity:
         raise HTTPException(400, "Entity name can't be empty.")
@@ -147,7 +172,8 @@ async def api_add_entity(client_id: str, body: EntityBody, _=Depends(require_log
 
 
 @app.delete("/api/clients/{client_id}/entities/{entity}")
-async def api_remove_entity(client_id: str, entity: str, _=Depends(require_login)):
+async def api_remove_entity(client_id: str, entity: str, username: str = Depends(require_login)):
+    _owned_or_403(client_id, username)
     entity = entity.strip().upper()
     entities, tokens = runtime_config.get_current(client_id)
     if entity in entities:
@@ -157,7 +183,8 @@ async def api_remove_entity(client_id: str, entity: str, _=Depends(require_login
 
 
 @app.post("/api/clients/{client_id}/tokens")
-async def api_set_token(client_id: str, body: TokenBody, _=Depends(require_login)):
+async def api_set_token(client_id: str, body: TokenBody, username: str = Depends(require_login)):
+    _owned_or_403(client_id, username)
     entity = body.entity.strip().upper()
     entities, tokens = runtime_config.get_current(client_id)
     tokens[entity] = body.token
@@ -166,7 +193,8 @@ async def api_set_token(client_id: str, body: TokenBody, _=Depends(require_login
 
 
 @app.delete("/api/clients/{client_id}")
-async def api_reset_client(client_id: str, _=Depends(require_login)):
+async def api_reset_client(client_id: str, username: str = Depends(require_login)):
+    _owned_or_403(client_id, username)
     runtime_config.delete_client(client_id)
     return {"status": "reset"}
 
@@ -192,6 +220,8 @@ BASE_STYLE = """
   }
   header h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: .3px; }
   header h1 span { color: var(--muted); font-weight: 400; }
+  .who { display: flex; align-items: center; gap: 12px; }
+  .who span { color: var(--muted); font-size: 13px; }
   main { padding: 28px 32px; max-width: 920px; margin: 0 auto; }
   button {
     background: var(--accent); color: white; border: none; border-radius: 6px;
@@ -221,11 +251,20 @@ BASE_STYLE = """
   .token-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; margin-bottom: 6px; align-items: center; }
   .empty-state { color: var(--muted); text-align: center; padding: 60px 0; }
   .toolbar { display: flex; gap: 8px; margin-bottom: 20px; }
+  .config-snippet {
+    background: #10131e; border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    margin-top: 10px;
+  }
+  .config-snippet code { color: var(--ok); }
+  .config-snippet button { padding: 3px 9px; font-size: 11px; }
   .login-box {
     max-width: 340px; margin: 12vh auto; background: var(--panel);
     border: 1px solid var(--border); border-radius: 10px; padding: 28px;
   }
-  .login-box h1 { font-size: 16px; margin-bottom: 16px; }
+  .login-box h1 { font-size: 16px; margin-bottom: 4px; }
+  .login-box p.hint { color: var(--muted); font-size: 12.5px; margin: 0 0 16px; }
   .login-box input { width: 100%; margin-bottom: 12px; }
   .login-box button { width: 100%; }
   .error { color: var(--danger); font-size: 12.5px; margin-top: -4px; margin-bottom: 12px; }
@@ -237,9 +276,11 @@ PAGE_LOGIN = """<!doctype html><html><head><meta charset="utf-8">
 <body>
   <div class="login-box">
     <h1>SUNET MCP Filter</h1>
+    <p class="hint">Don't have an account? Ask an admin to run <code>adduser</code> in the server CLI.</p>
     <form method="post" action="/login">
       __ERROR__
-      <input type="password" name="password" placeholder="Password" autofocus required>
+      <input type="text" name="username" placeholder="Username" autofocus required autocapitalize="off">
+      <input type="password" name="password" placeholder="Password" required>
       <button type="submit">Log in</button>
     </form>
   </div>
@@ -250,11 +291,14 @@ PAGE_DASHBOARD = """<!doctype html><html><head><meta charset="utf-8">
 <body>
 <header>
   <h1>SUNET MCP Filter <span>&mdash; PII filter settings</span></h1>
-  __LOGOUT_BUTTON__
+  <div class="who">
+    <span>__USERNAME__</span>
+    <button class="secondary" onclick="logout()">Log out</button>
+  </div>
 </header>
 <main>
   <div class="toolbar">
-    <input id="new-client-id" placeholder="New client id" style="flex:1">
+    <input id="new-client-id" placeholder="New client id, e.g. my-laptop" style="flex:1">
     <button onclick="addClient()">Add client</button>
     <button class="secondary" onclick="loadClients()">Refresh</button>
   </div>
@@ -284,7 +328,7 @@ async function loadClients() {
   const container = document.getElementById('clients');
   const ids = Object.keys(data);
   if (ids.length === 0) {
-    container.innerHTML = '<div class="empty-state">No clients have connected yet. Defaults will apply the moment one does, or add one manually above.</div>';
+    container.innerHTML = '<div class="empty-state">You haven\\'t added any clients yet. Add one above, then point your MCP client at the id it gives you.</div>';
     return;
   }
   container.innerHTML = ids.map(id => renderClient(id, data[id])).join('');
@@ -317,11 +361,20 @@ function renderClient(id, cfg) {
       </div>
       <div class="section-label">Replacement tokens</div>
       ${tokenRows || '<span class="muted">Add an entity to configure its token</span>'}
+      <div class="config-snippet">
+        <code>x-client-id: ${id}</code>
+        <button class="secondary" onclick="copySnippet('${id}')">Copy header</button>
+      </div>
+      <div class="muted" style="margin-top:6px">Send this header from your MCP client so its requests land under this id.</div>
       <div class="row" style="margin-top:12px">
         <button class="secondary" onclick="resetClient('${id}')">Reset to defaults</button>
       </div>
     </div>
   `;
+}
+
+function copySnippet(id) {
+  navigator.clipboard.writeText(`x-client-id: ${id}`);
 }
 
 function toggleCustomEntity(id) {
@@ -334,9 +387,8 @@ async function addClient() {
   const input = document.getElementById('new-client-id');
   const id = input.value.trim();
   if (!id) return;
-  // Fetching the client seeds it with defaults via get_current on the backend.
-  await api(`/api/clients/${encodeURIComponent(id)}`);
-  input.value = '';
+  const result = await api(`/api/clients/${encodeURIComponent(id)}`, {method: 'POST'});
+  if (result) input.value = '';
   loadClients();
 }
 
